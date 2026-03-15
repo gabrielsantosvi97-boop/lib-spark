@@ -119,6 +119,7 @@ lib-spark/
 │       │   └── evolver.py           # apply_evolution() -- aplica ALTER TABLE conforme politica
 │       ├── validator/
 │       │   └── validators.py        # Funcoes de validacao (config, merge keys, particoes, schema)
+│       ├── execution_resolver.py   # Resolver de params de runtime (DAG): modo, filtro de data, effective_write_config
 │       └── writer/
 │           ├── base.py              # BaseWriter (ABC)
 │           ├── append.py            # AppendWriter
@@ -131,6 +132,7 @@ lib-spark/
 │   ├── test_schema_manager.py       # Testes de comparacao de schema e promocoes de tipo
 │   ├── test_writers.py              # Testes de cada writer contra tabelas Iceberg reais
 │   ├── test_planner.py              # Testes de resolucao de writer e filtro incremental
+│   ├── test_runtime.py              # Testes de ExecutionResolver, apply_runtime_filter, effective_write_config
 │   └── test_core_integration.py     # Testes end-to-end via GlueTableManager
 ├── pyproject.toml                   # Configuracao de build, dependencias, pytest
 └── README.md                        # Documentacao de uso para o consumidor
@@ -177,6 +179,7 @@ Centraliza todos os modelos de dados como `dataclass` e `Enum`. Nenhum modelo co
 - `WriteMode` -- modos de escrita (APPEND, OVERWRITE_TABLE, OVERWRITE_PARTITIONS, MERGE)
 - `LoadStrategy` -- estrategias de carga (FULL, INCREMENTAL)
 - `SchemaPolicy` -- politicas de evolucao de schema (STRICT, SAFE_SCHEMA_EVOLUTION, FAIL_ON_DIFF, CUSTOM)
+- `ExecutionMode` -- modo de execucao para params de runtime/DAG (FULL_REFRESH, INCREMENTAL_DEFAULT, FROM_DATE, DATE_RANGE)
 
 **Dataclasses principais:**
 - `WriteConfig` -- parametros obrigatorios e opcionais de uma escrita
@@ -187,6 +190,9 @@ Centraliza todos os modelos de dados como `dataclass` e `Enum`. Nenhum modelo co
 - `TableMetadata` -- metadados resolvidos do catalogo (schema, particoes, location, existencia)
 - `ExecutionPlan` -- agrupa writer + metadados + config (usado internamente pelo planner)
 - `WriteResult` -- resultado retornado ao consumidor apos cada escrita
+- `RuntimeParams` -- parametros brutos de runtime (full_refresh, date_start, date_end) vindos da DAG
+- `JobExecutionConfig` -- config do job para runtime: default_mode, date_column, supports_full_refresh/from_date/date_range
+- `ExecutionContext` -- resultado da resolucao: execution_mode, effective_date_start/end, is_full_refresh, should_apply_date_filter
 
 **Constantes:**
 - `VALID_DISTRIBUTION_MODES` -- tupla com modos validos para o Iceberg (`"none"`, `"hash"`, `"range"`)
@@ -206,7 +212,10 @@ LibSparkError
   ├── MergeKeyError             # Chave de merge ausente no DataFrame ou na tabela
   ├── PartitionValidationError  # Coluna de particao invalida
   ├── SchemaValidationError     # Schema incompativel
-  └── SchemaEvolutionBlockedError # Evolucao de schema bloqueada pela politica
+  ├── SchemaEvolutionBlockedError # Evolucao de schema bloqueada pela politica
+  ├── RuntimeParamsError        # Erro generico de params de runtime (DAG)
+  ├── InvalidRuntimeParamsError # date_end sem date_start, ou date_start > date_end
+  └── UnsupportedExecutionModeError # Job nao suporta o modo resolvido (ex.: full_refresh sem suporte)
 ```
 
 **Convencao:** Nunca lance `Exception` diretamente. Sempre use uma subclasse de `LibSparkError` para que o consumidor possa capturar erros da lib de forma granular ou generalizada.
@@ -273,6 +282,27 @@ Contem funcoes puras de validacao (sem efeitos colaterais). Cada funcao:
 **Convencao:** Validacoes que dependem de configs opcionais (optimization, maintenance) verificam `config.enabled` primeiro e retornam imediatamente se desabilitada.
 
 **Para adicionar uma nova validacao:** Crie a funcao em `validators.py`, importe-a em `core.py` e chame-a no ponto adequado do fluxo.
+
+**Validacoes de runtime (DAG):** `validate_runtime_dates(date_start, date_end)` e `validate_job_supports_mode(job_config, mode)` validam parametros vindos da DAG e lancam `InvalidRuntimeParamsError` ou `UnsupportedExecutionModeError`. Usadas pelo `ExecutionResolver`.
+
+---
+
+### execution_resolver.py -- Parametros de runtime (DAG)
+
+Este modulo nao faz parte do fluxo interno do `GlueTableManager.write()`. Ele e usado **pelo desenvolvedor** antes de chamar o manager, quando o job recebe parametros da DAG (ex.: Airflow trigger manual: `full_refresh`, `date_start`, `date_end`).
+
+**Responsabilidades:**
+
+1. **Normalizacao:** Converte `full_refresh` (bool ou string "true"/"1"/"yes") e trim de datas; valores vazios viram `None`.
+2. **Resolucao do modo:** A partir de `RuntimeParams` e `JobExecutionConfig`, determina o `ExecutionMode` efetivo (precedencia: full_refresh > date_range > from_date > incremental_default) e monta um `ExecutionContext`.
+3. **Validacao:** Chama `validate_runtime_dates()` e `validate_job_supports_mode()`; lanca excecoes de runtime se invalido.
+4. **Helpers para o consumidor:**
+   - `apply_runtime_filter(df, context, date_column)` — aplica filtro de data no DataFrame conforme o modo (FULL_REFRESH/INCREMENTAL_DEFAULT: sem filtro; FROM_DATE: `>= date_start`; DATE_RANGE: intervalo).
+   - `effective_write_config(config, context)` — se `context.is_full_refresh`, retorna copia do `WriteConfig` com `load_strategy=FULL` e incremental_column/value=None; senao retorna o config inalterado.
+
+**Fluxo:** params (DAG) -> `ExecutionResolver.resolve()` -> `ExecutionContext` -> `apply_runtime_filter()` + `effective_write_config()` -> desenvolvedor chama `manager.write(df_filtered, write_config)`.
+
+**Convencao:** Nenhuma integracao automatica no `core.py` nem no planner; a integracao e feita pelo desenvolvedor ao chamar o resolver e os helpers antes de `manager.write()`.
 
 ---
 

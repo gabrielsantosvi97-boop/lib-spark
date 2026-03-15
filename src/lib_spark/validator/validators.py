@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Set
+from typing import Optional, Set
 
 from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType
 
 from lib_spark.config import (
     VALID_DISTRIBUTION_MODES,
+    ExecutionMode,
+    JobExecutionConfig,
     LoadStrategy,
     MaintenanceConfig,
     TableMetadata,
@@ -17,9 +19,11 @@ from lib_spark.config import (
 )
 from lib_spark.exceptions import (
     InvalidConfigError,
+    InvalidRuntimeParamsError,
     MergeKeyError,
     PartitionValidationError,
     SchemaValidationError,
+    UnsupportedExecutionModeError,
 )
 
 logger = logging.getLogger("lib_spark.validator")
@@ -215,3 +219,50 @@ def validate_maintenance_config(config: MaintenanceConfig) -> None:
         )
 
     logger.debug("Maintenance config validation passed.")
+
+
+def validate_runtime_dates(
+    date_start: Optional[str],
+    date_end: Optional[str],
+) -> None:
+    """Validate date_start/date_end combination for runtime params.
+
+    Raises InvalidRuntimeParamsError if date_end is set without date_start,
+    or if date_start > date_end.
+    """
+    if date_end and not date_start:
+        raise InvalidRuntimeParamsError(
+            "date_end requires date_start. Provide date_start when using date_end."
+        )
+    if date_start and date_end and date_start > date_end:
+        raise InvalidRuntimeParamsError(
+            f"date_start ({date_start}) must be less than or equal to date_end ({date_end})."
+        )
+    logger.debug(
+        "Runtime dates validated: date_start=%s, date_end=%s",
+        date_start,
+        date_end,
+    )
+
+
+def validate_job_supports_mode(
+    job_config: JobExecutionConfig,
+    mode: ExecutionMode,
+) -> None:
+    """Check that the job supports the resolved execution mode.
+
+    Raises UnsupportedExecutionModeError if the mode is not supported.
+    """
+    if mode == ExecutionMode.FULL_REFRESH and not job_config.supports_full_refresh:
+        raise UnsupportedExecutionModeError(
+            "Job does not support full_refresh. Set supports_full_refresh=True in JobExecutionConfig to allow it."
+        )
+    if mode == ExecutionMode.FROM_DATE and not job_config.supports_from_date:
+        raise UnsupportedExecutionModeError(
+            "Job does not support from_date (date_start only). Set supports_from_date=True in JobExecutionConfig to allow it."
+        )
+    if mode == ExecutionMode.DATE_RANGE and not job_config.supports_date_range:
+        raise UnsupportedExecutionModeError(
+            "Job does not support date_range (date_start + date_end). Set supports_date_range=True in JobExecutionConfig to allow it."
+        )
+    logger.debug("Job supports execution mode: %s", mode.value)

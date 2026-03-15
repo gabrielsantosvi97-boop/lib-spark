@@ -28,21 +28,22 @@ Biblioteca PySpark para escrita padronizada em tabelas Iceberg registradas no AW
    - [full](#full)
    - [incremental](#incremental)
 8. [Leitura de tabelas](#leitura-de-tabelas)
-9. [Otimizacao de escrita](#otimizacao-de-escrita)
-10. [Manutencao de tabelas](#manutencao-de-tabelas)
-11. [Politicas de schema](#politicas-de-schema)
+9. [Parametros de runtime (DAG)](#parametros-de-runtime-dag)
+10. [Otimizacao de escrita](#otimizacao-de-escrita)
+11. [Manutencao de tabelas](#manutencao-de-tabelas)
+12. [Politicas de schema](#politicas-de-schema)
     - [STRICT](#strict)
     - [SAFE_SCHEMA_EVOLUTION](#safe_schema_evolution)
     - [FAIL_ON_DIFF](#fail_on_diff)
     - [CUSTOM](#custom)
-12. [Validacoes automaticas](#validacoes-automaticas)
-13. [Auditoria e observabilidade](#auditoria-e-observabilidade)
-14. [Tratamento de erros](#tratamento-de-erros)
-15. [Arquitetura interna](#arquitetura-interna)
-16. [Referencia de configuracao](#referencia-de-configuracao)
-17. [Exemplos completos](#exemplos-completos)
-18. [Build e distribuicao](#build-e-distribuicao)
-19. [Testes](#testes)
+13. [Validacoes automaticas](#validacoes-automaticas)
+14. [Auditoria e observabilidade](#auditoria-e-observabilidade)
+15. [Tratamento de erros](#tratamento-de-erros)
+16. [Arquitetura interna](#arquitetura-interna)
+17. [Referencia de configuracao](#referencia-de-configuracao)
+18. [Exemplos completos](#exemplos-completos)
+19. [Build e distribuicao](#build-e-distribuicao)
+20. [Testes](#testes)
 
 ---
 
@@ -494,6 +495,187 @@ df = manager.read(
 
 ---
 
+## Parametros de runtime (DAG)
+
+Quando o job e orquestrado por uma DAG (ex.: Airflow), parametros como **full_refresh**, **date_start** e **date_end** podem vir do trigger manual. A lib-spark oferece uma camada para validar, normalizar e resolver o modo de execucao, aplicar filtros de data de forma padronizada e fazer `full_refresh` sobrescrever a estrategia incremental **sem que o desenvolvedor escreva** `if full_refresh` ou `if date_start` em cada job.
+
+### Conceitos
+
+| Conceito | Descricao |
+|---|---|
+| **RuntimeParams** | Parametros brutos vindos da DAG: `full_refresh` (bool ou string), `date_start`, `date_end` (strings ou vazios) |
+| **JobExecutionConfig** | Configuracao do job: modo padrao, coluna de data, e quais modos o job suporta (`supports_full_refresh`, `supports_from_date`, `supports_date_range`) |
+| **ExecutionContext** | Resultado da resolucao: modo efetivo, `effective_date_start`/`effective_date_end`, flags `is_full_refresh` e `should_apply_date_filter` |
+| **ExecutionMode** | Modo de execucao: `FULL_REFRESH`, `INCREMENTAL_DEFAULT`, `FROM_DATE`, `DATE_RANGE` |
+
+### Precedencia do modo
+
+O modo e resolvido na seguinte ordem (o primeiro que se aplicar vence):
+
+| Prioridade | Condicao | Modo |
+|---|---|---|
+| 1 | `full_refresh=True` (ou string "true"/"1"/"yes") | `FULL_REFRESH` |
+| 2 | `date_start` e `date_end` informados | `DATE_RANGE` |
+| 3 | Apenas `date_start` informado | `FROM_DATE` |
+| 4 | Nenhum parametro (ou defaults) | `INCREMENTAL_DEFAULT` (ou o `default_mode` do `JobExecutionConfig`) |
+
+**Regras para datas:**
+
+- Se `date_end` for informado, `date_start` e obrigatorio.
+- `date_start` deve ser menor ou igual a `date_end`.
+- Valores vazios ou `None` sao ignorados (sem filtro de data).
+
+### full_refresh e estrategia incremental
+
+Quando o contexto e `FULL_REFRESH`, a biblioteca trata isso de duas formas que o desenvolvedor usa **antes** de chamar `manager.write()`:
+
+1. **Filtro de dados:** `apply_runtime_filter(df, context, date_column)` — em modo FULL_REFRESH ou INCREMENTAL_DEFAULT **nao aplica** filtro; em FROM_DATE aplica `col >= effective_date_start`; em DATE_RANGE aplica o intervalo.
+2. **Config de escrita:** `effective_write_config(config, context)` — se `context.is_full_refresh` e True, retorna uma **copia** do `WriteConfig` com `load_strategy=LoadStrategy.FULL` e `incremental_column`/`incremental_value=None`; senao retorna o config inalterado. Assim, o mesmo job pode ser chamado com params de full refresh e a escrita sera full, sem o desenvolvedor checar `if full_refresh` no codigo.
+
+### Parametros via spark-submit (recomendado para DAG)
+
+A DAG pode repassar os parametros para o job via argumentos do spark-submit. O script recebe `--data_inicio`, `--data_fim` e `--full_refresh` e usa `parse_runtime_params_from_argv()` para obter um `RuntimeParams`:
+
+```bash
+spark-submit --py-files s3://bucket/libs/lib_spark-0.1.0-py3-none-any.whl \
+  s3://bucket/jobs/meu_job.py --data_inicio=2025-05-01 --data_fim=2025-05-31
+```
+
+No script, use `parse_runtime_params_from_argv()` (sem argumentos para ler `sys.argv`; ou passe uma lista de strings para testes). Aceita tambem `--date_start` / `--date_end` como alias e `--full-refresh` como alias de `--full_refresh`.
+
+### Como o engenheiro de dados deve construir o script PySpark
+
+Para que o job suporte parametros vindos da DAG (`--data_inicio`, `--data_fim`, `--full_refresh`), o script PySpark precisa seguir um fluxo unico e previsivel. Nao e necessario escrever `if full_refresh` ou `if date_start` manualmente: a lib-spark centraliza essa logica.
+
+**Passos obrigatorios no script:**
+
+1. **Obter a SparkSession** (como ja faz hoje).
+2. **Ler os parametros da DAG** — chamar `parse_runtime_params_from_argv()`. Isso le os argumentos que a DAG passou no spark-submit (ex.: `--data_inicio=2025-05-01`) e devolve um `RuntimeParams`. Se o job nao for disparado pela DAG, o spark-submit nao precisa passar esses args; o parser usa defaults (sem data, full_refresh=false).
+3. **Definir a configuracao do job** — criar um `JobExecutionConfig` com: `default_mode` (geralmente `INCREMENTAL_DEFAULT`), `date_column` (nome da coluna de data usada no filtro, ex.: `"dt"` ou `"updated_at"`), e os flags `supports_full_refresh`, `supports_from_date`, `supports_date_range` conforme o que o job aceita.
+4. **Resolver o contexto** — chamar `ExecutionResolver().resolve(params, job_config)`. O resultado e um `ExecutionContext` (modo efetivo, datas efetivas, flags). Se os params forem invalidos (ex.: data_fim sem data_inicio), o resolver lanca excecao e o job falha de forma controlada.
+5. **Ler ou montar o DataFrame** — como hoje (ex.: `spark.sql(...)` ou `manager.read(...)`).
+6. **Aplicar o filtro de data** — chamar `apply_runtime_filter(df, context, job_config.date_column)`. Em FULL_REFRESH ou sem datas, nao altera o DataFrame; em FROM_DATE ou DATE_RANGE, aplica o filtro pela coluna de data. O script sempre usa o DataFrame retornado daqui em diante.
+7. **Definir o WriteConfig base** — o mesmo que o job usaria sem runtime params (tabela, write_mode, load_strategy, incremental_column, incremental_value, etc.).
+8. **Obter o config efetivo** — chamar `effective_write_config(base_config, context)`. Se o contexto for full_refresh, a lib retorna um config com estrategia FULL e sem incremental; senao retorna o config inalterado.
+9. **Escrever** — chamar `manager.write(df_filtered, write_config)`.
+
+**Resumo do fluxo no codigo:**
+
+```
+params = parse_runtime_params_from_argv()
+job_config = JobExecutionConfig(default_mode=..., date_column="dt", supports_...=True)
+context = ExecutionResolver().resolve(params, job_config)
+df = ...  # leitura/transformacao
+df_filtered = apply_runtime_filter(df, context, job_config.date_column)
+write_config = effective_write_config(base_write_config, context)
+manager.write(df_filtered, write_config)
+```
+
+**O que a DAG precisa fazer:** ao montar o comando do step (ex.: EmrAddStepsOperator), incluir nos argumentos do spark-submit os parametros que o usuario informou no trigger, por exemplo: `--data_inicio={{ ti.xcom_pull(...) }}`, `--data_fim=...`, `--full_refresh=...`. O script so precisa chamar `parse_runtime_params_from_argv()` no inicio; nao precisa ler variaveis de ambiente nem outro mecanismo, a menos que a equipe prefira.
+
+**Coluna de data:** o valor de `JobExecutionConfig.date_column` deve ser o nome da coluna do DataFrame que representa a data do registro (ex.: `dt`, `data_ref`, `updated_at`). E essa coluna que `apply_runtime_filter` usa para aplicar `>= date_start` ou o intervalo. Se a tabela for particionada por essa coluna, o filtro tambem reduz dados lidos/escritos.
+
+### Uso tipico
+
+1. Obter parametros da DAG: no script, chamar `params = parse_runtime_params_from_argv()` (argumentos do spark-submit) ou instanciar `RuntimeParams` manualmente (ex.: variaveis de ambiente).
+2. Instanciar `JobExecutionConfig`.
+3. Chamar `ExecutionResolver.resolve(params, job_config)` para obter `ExecutionContext`.
+4. (Opcional) Validar datas com `validate_runtime_dates(date_start, date_end)` — o resolver ja chama isso internamente.
+5. Aplicar filtro no DataFrame: `df_filtered = apply_runtime_filter(df, context, job_config.date_column)`.
+6. Obter o config de escrita efetivo: `write_config = effective_write_config(base_config, context)`.
+7. Chamar `manager.write(df_filtered, write_config)`.
+
+### Excecoes de runtime
+
+| Excecao | Quando e lancada |
+|---|---|
+| **RuntimeParamsError** | Erro generico de parametros de runtime (base para as demais) |
+| **InvalidRuntimeParamsError** | `date_end` sem `date_start`, ou `date_start` > `date_end` |
+| **UnsupportedExecutionModeError** | O job nao suporta o modo resolvido (ex.: full_refresh=True mas `supports_full_refresh=False`) |
+
+Todas herdam de `LibSparkError`; podem ser capturadas de forma especifica ou junto com outras excecoes da lib.
+
+### Exemplo: job simples com params da DAG (spark-submit --data_inicio=...)
+
+```python
+from lib_spark import (
+    GlueTableManager, WriteConfig, WriteMode, LoadStrategy,
+    ExecutionMode, ExecutionResolver, parse_runtime_params_from_argv,
+    RuntimeParams, JobExecutionConfig,
+    apply_runtime_filter, effective_write_config,
+)
+
+manager = GlueTableManager(spark)
+
+# Parametros vindos da DAG: spark-submit ... meu_job.py --data_inicio=2025-05-01 [--data_fim=...] [--full_refresh=true]
+params = parse_runtime_params_from_argv()
+
+job_config = JobExecutionConfig(
+    default_mode=ExecutionMode.INCREMENTAL_DEFAULT,
+    date_column="dt",
+    supports_full_refresh=True,
+    supports_from_date=True,
+    supports_date_range=True,
+)
+
+context = ExecutionResolver.resolve(params, job_config)
+df = spark.sql("SELECT * FROM staging.vendas")
+df_filtered = apply_runtime_filter(df, context, job_config.date_column)
+config = effective_write_config(
+    WriteConfig(
+        target_table="glue_catalog.silver.fato_vendas",
+        write_mode=WriteMode.APPEND,
+        load_strategy=LoadStrategy.INCREMENTAL,
+        incremental_column="dt",
+        incremental_value="2024-01-01",
+    ),
+    context,
+)
+result = manager.write(df_filtered, config)
+```
+
+### Exemplo: full_refresh + datas (trigger manual)
+
+Se o usuario passar `full_refresh=true` e `date_start=2024-02-01`, o modo resolvido sera **FULL_REFRESH** (full_refresh tem prioridade). O `effective_write_config` trocara a estrategia para FULL e o `apply_runtime_filter` nao aplicara filtro de data. Se passar apenas `date_start=2024-02-01`, o modo sera **FROM_DATE** e o filtro sera `dt >= "2024-02-01"`.
+
+### Exemplo: fluxo completo (resolver + filtro + write)
+
+```python
+from lib_spark import (
+    ExecutionMode, RuntimeParams, JobExecutionConfig,
+    ExecutionResolver, apply_runtime_filter, effective_write_config,
+    GlueTableManager, WriteConfig, WriteMode, LoadStrategy,
+)
+
+params = RuntimeParams(full_refresh=False, date_start="2024-01-01", date_end="2024-01-31")
+job_config = JobExecutionConfig(
+    default_mode=ExecutionMode.INCREMENTAL_DEFAULT,
+    date_column="updated_at",
+    supports_full_refresh=True,
+    supports_from_date=True,
+    supports_date_range=True,
+)
+context = ExecutionResolver.resolve(params, job_config)
+# context.execution_mode == ExecutionMode.DATE_RANGE
+# context.effective_date_start == "2024-01-01", context.effective_date_end == "2024-01-31"
+
+df = manager.read("glue_catalog.bronze.eventos")
+df_filtered = apply_runtime_filter(df, context, job_config.date_column)
+config = effective_write_config(
+    WriteConfig(
+        target_table="glue_catalog.silver.eventos",
+        write_mode=WriteMode.APPEND,
+        load_strategy=LoadStrategy.INCREMENTAL,
+        incremental_column="updated_at",
+        incremental_value="2023-12-01",
+    ),
+    context,
+)
+result = manager.write(df_filtered, config)
+```
+
+---
+
 ## Otimizacao de escrita
 
 Um dos problemas mais comuns em pipelines PySpark e a criacao excessiva de small files (arquivos muito pequenos no storage). Isso degrada a performance de leitura, aumenta custos de metadados e torna consultas lentas.
@@ -811,7 +993,10 @@ LibSparkError
   ├── MergeKeyError
   ├── PartitionValidationError
   ├── SchemaValidationError
-  └── SchemaEvolutionBlockedError
+  ├── SchemaEvolutionBlockedError
+  ├── RuntimeParamsError
+  ├── InvalidRuntimeParamsError
+  └── UnsupportedExecutionModeError
 ```
 
 ### Captura generalizada
@@ -1235,15 +1420,16 @@ pytest
 
 ### Estrutura de testes
 
-| Arquivo | Escopo |
-|---|---|
-| `tests/conftest.py` | SparkSession local com catalogo Iceberg hadoop |
-| `tests/test_config.py` | Enums, dataclasses, SchemaDiff |
-| `tests/test_validators.py` | Todas as funcoes de validacao |
-| `tests/test_schema_manager.py` | Comparacao de schemas e promocoes de tipo |
-| `tests/test_writers.py` | Append, overwrite, merge com tabelas Iceberg reais |
-| `tests/test_planner.py` | Resolucao de writer e filtro incremental |
-| `tests/test_core_integration.py` | Fluxo completo via GlueTableManager (inclui testes de optimization e maintenance) |
+| Arquivo                          | Escopo                                                                                 |
+| ----------------------------------| ----------------------------------------------------------------------------------------|
+| `tests/conftest.py`              | SparkSession local com catalogo Iceberg hadoop                                         |
+| `tests/test_config.py`           | Enums, dataclasses, SchemaDiff                                                         |
+| `tests/test_validators.py`       | Todas as funcoes de validacao                                                          |
+| `tests/test_schema_manager.py`   | Comparacao de schemas e promocoes de tipo                                              |
+| `tests/test_writers.py`          | Append, overwrite, merge com tabelas Iceberg reais                                     |
+| `tests/test_planner.py`          | Resolucao de writer e filtro incremental                                               |
+| `tests/test_runtime.py`          | ExecutionResolver, apply_runtime_filter, effective_write_config, validacoes de runtime |
+| `tests/test_core_integration.py` | Fluxo completo via GlueTableManager (inclui testes de optimization e maintenance)      |
 
 Os testes de integracao criam tabelas Iceberg em um catalogo hadoop local (sem necessidade de AWS).
 

@@ -20,6 +20,15 @@ class LoadStrategy(Enum):
     INCREMENTAL = "incremental"
 
 
+class ExecutionMode(Enum):
+    """Effective execution mode resolved from runtime params (full_refresh, date_start, date_end)."""
+
+    FULL_REFRESH = "full_refresh"
+    INCREMENTAL_DEFAULT = "incremental_default"
+    FROM_DATE = "from_date"
+    DATE_RANGE = "date_range"
+
+
 class SchemaPolicy(Enum):
     STRICT = "strict"
     SAFE_SCHEMA_EVOLUTION = "safe_schema_evolution"
@@ -55,6 +64,37 @@ class SchemaDiff:
 
 
 VALID_DISTRIBUTION_MODES = ("none", "hash", "range")
+
+
+@dataclass
+class RuntimeParams:
+    """Raw runtime parameters as received from the DAG (e.g. Airflow trigger)."""
+
+    full_refresh: Optional[Any] = None  # bool or str from CLI
+    date_start: Optional[Any] = None  # str or None
+    date_end: Optional[Any] = None  # str or None
+
+
+@dataclass
+class JobExecutionConfig:
+    """Declares the job's default behavior and which execution modes it supports."""
+
+    default_mode: ExecutionMode = ExecutionMode.INCREMENTAL_DEFAULT
+    date_column: str = "dt"
+    supports_full_refresh: bool = True
+    supports_from_date: bool = True
+    supports_date_range: bool = True
+
+
+@dataclass
+class ExecutionContext:
+    """Resolved, normalized execution context; the job consumes only this."""
+
+    execution_mode: ExecutionMode
+    effective_date_start: Optional[str] = None  # YYYY-MM-DD
+    effective_date_end: Optional[str] = None  # YYYY-MM-DD
+    is_full_refresh: bool = False
+    should_apply_date_filter: bool = False
 
 
 @dataclass
