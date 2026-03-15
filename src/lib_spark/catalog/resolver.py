@@ -40,16 +40,7 @@ class CatalogResolver:
 
     def table_exists(self, table_name: str) -> bool:
         try:
-            parts = table_name.strip().split(".")
-            if len(parts) == 3:
-                db_part = f"{parts[0]}.{parts[1]}"
-                tbl_part = parts[2]
-            elif len(parts) == 2:
-                db_part = parts[0]
-                tbl_part = parts[1]
-            else:
-                return False
-            return self._spark.catalog.tableExists(tbl_part, db_part)
+            return self._spark.catalog.tableExists(table_name)
         except Exception:
             try:
                 self._spark.table(table_name)
@@ -83,22 +74,44 @@ class CatalogResolver:
         return self._spark.table(table_name).schema
 
     def _get_partition_columns(self, table_name: str) -> List[str]:
-        """Retrieve partition columns via DESCRIBE TABLE output."""
+        """Retrieve partition columns via DESCRIBE TABLE EXTENDED output.
+
+        Handles both Hive-style ("# Partition Information" followed by
+        column names) and Iceberg-style ("# Partitioning" followed by
+        "Part N  column_name") formats.
+        """
         try:
-            desc_df = self._spark.sql(f"DESCRIBE TABLE {table_name}")
+            desc_df = self._spark.sql(
+                f"DESCRIBE TABLE EXTENDED {table_name}"
+            )
             rows = desc_df.collect()
 
             partition_section = False
             partition_cols: List[str] = []
             for row in rows:
                 col_name = str(row[0]).strip() if row[0] else ""
+
                 if col_name.startswith("# Partition"):
                     partition_section = True
                     continue
+
                 if partition_section:
-                    if col_name.startswith("#") or col_name == "":
+                    if col_name == "" or (
+                        col_name.startswith("#")
+                        and not col_name.lower().startswith("# col_name")
+                    ):
                         break
-                    partition_cols.append(col_name)
+
+                    if col_name.lower().startswith("# col_name"):
+                        continue
+
+                    if col_name.lower().startswith("part "):
+                        data_type = str(row[1]).strip() if row[1] else ""
+                        if data_type:
+                            partition_cols.append(data_type)
+                    else:
+                        partition_cols.append(col_name)
+
             return partition_cols
         except Exception as exc:
             logger.warning(

@@ -1247,6 +1247,15 @@ pytest
 
 Os testes de integracao criam tabelas Iceberg em um catalogo hadoop local (sem necessidade de AWS).
 
+### Testes no EMR (script `scripts/test_on_emr.py`)
+
+O script `scripts/test_on_emr.py` executa uma suíte de testes contra tabelas Iceberg reais no Glue Catalog (para uso como EMR step). E obrigatorio informar o **bucket S3** de uma das formas:
+
+- **Variavel de ambiente:** `export LIB_SPARK_TEST_BUCKET=meu-bucket`
+- **Argumento:** `spark-submit ... test_on_emr.py meu-bucket`
+
+Ver `INFRASTRUCTURE.md` para o provisionamento completo da infraestrutura AWS e o comando do EMR step.
+
 ---
 
 ## Nota de migracao (v0.1.0)
