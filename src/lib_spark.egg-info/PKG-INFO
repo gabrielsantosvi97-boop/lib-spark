@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: lib-spark
+Version: 0.1.0
+Summary: Biblioteca PySpark para escrita padronizada em tabelas Iceberg no AWS Glue Catalog
+License: MIT
+Requires-Python: >=3.9
+Provides-Extra: spark
+Requires-Dist: pyspark>=3.5.0; extra == "spark"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pyspark>=3.5.0; extra == "dev"

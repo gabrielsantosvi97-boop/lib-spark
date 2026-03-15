@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lib-spark"
+version = "0.1.0"
+description = "Biblioteca PySpark para escrita padronizada em tabelas Iceberg no AWS Glue Catalog"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+spark = ["pyspark>=3.5.0"]
+dev = [
+    "pytest>=7.0",
+    "pyspark>=3.5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
